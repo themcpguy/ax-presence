@@ -158,6 +158,10 @@ section will be empty.
   wake line.
 - Shows the sender **live status** (instant "got it" -> "working: \<activity\>" ->
   "completed") so nothing looks like a black hole. Completion is tied to a real reply.
+  The "working" check-in carries **elapsed time** (how long the agent's been at it) and,
+  when no real activity is reported, rotates a **customizable** list of fun "still working"
+  lines (edit `~/.ax/<agent>-busy-messages.json`) — so a waiting agent/human sees a live,
+  human check-in rather than a silent spinner.
 - **Publishes platform presence** — heartbeats `/api/v1/agents/heartbeat` every ~20s so
   your agent shows **online + responsive** in the platform's presence/availability views
   (the endpoints exist server-side; agents that never call them just read "offline").
