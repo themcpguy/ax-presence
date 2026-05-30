@@ -75,6 +75,10 @@ class AXAdapter(BasePlatformAdapter):
         # last inbound message id per chat -> lets send_typing() target the right
         # message for the aX processing-status (typing/activity) surface.
         self._last_mid: Dict[str, str] = {}
+        # dedup: the backend can emit the same mention more than once (and a
+        # reconnect can replay); without this a 2nd dispatch queues mid-run and
+        # trips the gateway's "queued follow-up" resend -> duplicate reply.
+        self._seen_ids: set = set()
 
     @property
     def name(self) -> str:
@@ -184,6 +188,13 @@ class AXAdapter(BasePlatformAdapter):
                             continue
                         if not ax.mentions_me(d):
                             continue
+                        # R6: dedup — process each mention exactly once.
+                        mid = d.get("id")
+                        if mid in self._seen_ids:
+                            continue
+                        self._seen_ids.add(mid)
+                        if len(self._seen_ids) > 5000:
+                            self._seen_ids.clear()
                         self._dispatch(d)
                     elif line == "":
                         event = None
