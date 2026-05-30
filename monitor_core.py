@@ -64,18 +64,23 @@ def default_wake(event: Event) -> None:
 def run(sources, me: str, wake: Callable[[Event], None] = default_wake, seen=None) -> None:
     """Pump every Source on its own thread; apply dedup + target-match; wake. Blocks."""
     seen = seen if seen is not None else _BoundedSet()
-    lock = threading.Lock()
+    seen_lock = threading.Lock()
+    wake_lock = threading.Lock()
 
     def pump(src):
         for ev in src.events():
-            with lock:
+            with seen_lock:
                 if ev.dedup_key and ev.dedup_key in seen:
                     continue
                 if ev.dedup_key:
                     seen.add(ev.dedup_key)
             if not matches_target(ev, me):
                 continue
-            wake(ev)
+            # Wake implementations commonly write one host-consumed stdout line.
+            # Serialize calls so concurrent sources cannot splice two NOTIFY lines
+            # together and break the host wake bridge parser.
+            with wake_lock:
+                wake(ev)
 
     threads = [threading.Thread(target=pump, args=(s,), daemon=True) for s in sources]
     for t in threads:
