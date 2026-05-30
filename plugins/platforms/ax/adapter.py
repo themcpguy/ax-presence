@@ -79,6 +79,11 @@ class AXAdapter(BasePlatformAdapter):
         # reconnect can replay); without this a 2nd dispatch queues mid-run and
         # trips the gateway's "queued follow-up" resend -> duplicate reply.
         self._seen_ids: set = set()
+        # sender-name cache (sender_id/agent_id -> display_name). The SSE mention
+        # event omits display_name, so the agent would see the sender as
+        # "someone" and get confused about who it's talking to (R7). We resolve
+        # the real name via a one-shot REST lookup of the message and cache it.
+        self._name_cache: Dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -205,12 +210,41 @@ class AXAdapter(BasePlatformAdapter):
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
 
+    def _resolve_sender_name(self, d: dict) -> str:
+        """Return the sender's real display name. The SSE mention event omits it,
+        so fall back to a one-shot REST lookup of the message (cached by id)."""
+        name = d.get("display_name") or d.get("username")
+        if name:
+            return str(name)
+        sid = d.get("agent_id") or d.get("sender_id")
+        if sid and sid in self._name_cache:
+            return self._name_cache[sid]
+        mid = d.get("id")
+        if mid:
+            try:
+                import json as _json
+                import urllib.request
+                at = ax.current_access_token()
+                req = urllib.request.Request(
+                    f"{ax.MESSAGES_URL}/{mid}", headers={"Authorization": "Bearer " + at})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    m = _json.load(r)
+                m = m.get("message") or m
+                name = m.get("display_name") or m.get("username")
+                if name:
+                    if sid:
+                        self._name_cache[sid] = str(name)
+                    return str(name)
+            except Exception as e:
+                logger.debug("aX: sender-name resolve failed for %s: %r", mid, e)
+        return str(sid or "someone")
+
     def _dispatch(self, d: dict) -> None:
         """Build a MessageEvent from an aX mention and schedule handle_message."""
         mid = d.get("id")
         chat_id = d.get("space_id") or self.space_id
         self._last_mid[chat_id] = mid
-        who = d.get("username") or d.get("display_name") or d.get("agent_id") or "someone"
+        who = self._resolve_sender_name(d)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_id,
