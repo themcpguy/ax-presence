@@ -375,7 +375,13 @@ class AXAdapter(BasePlatformAdapter):
         """Blocking: post a message carrying the uploaded file as an attachment."""
         import json as _json
         import urllib.request
-        payload = {"content": content or "", "space_id": chat_id, "channel": "main",
+        # aX rejects empty/whitespace content even when an attachment is present
+        # (400 "Message content cannot be empty"). The gateway calls send_voice
+        # with no caption, so default to the file name as the content.
+        text = (content or "").strip()
+        if not text:
+            text = (isinstance(up, dict) and (up.get("original_filename") or up.get("filename"))) or "📎 attachment"
+        payload = {"content": text, "space_id": chat_id, "channel": "main",
                    "message_type": "text", "attachments": [up]}
         if reply_to:
             payload["parent_id"] = reply_to
