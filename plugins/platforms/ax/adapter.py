@@ -295,6 +295,50 @@ class AXAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def edit_message(self, chat_id: str, message_id: str, content: str,
+                           reply_to: Optional[str] = None,
+                           metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Edit a message in place (aX: PATCH /api/v1/messages/{id}).
+
+        Implementing this is what makes the gateway stream its rich per-tool
+        progress feed to aX — without edit_message the gateway SKIPS tool
+        progress entirely. The gateway posts one progress message via send()
+        then edits it here with each tool/step, so the sender sees a live
+        'what the agent is doing right now' feed instead of a black box.
+        We also mirror the latest line to the aX processing-status (Activity
+        Monitor) so the progress shows there too.
+        """
+        loop = asyncio.get_running_loop()
+        # mirror the freshest progress line to the activity/processing surface
+        last_line = next((l for l in reversed(content.splitlines()) if l.strip()), content)
+        mid = self._last_mid.get(chat_id)
+        if mid:
+            try:
+                await loop.run_in_executor(
+                    None, lambda: ax.post_processing_status(mid, "thinking", last_line[:200]))
+            except Exception:
+                pass
+        try:
+            ok = await loop.run_in_executor(None, lambda: self._ax_edit(message_id, content))
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+        return SendResult(success=bool(ok), message_id=message_id, retryable=not ok)
+
+    @staticmethod
+    def _ax_edit(message_id: str, content: str) -> bool:
+        """PATCH an existing aX message's content. Returns True on 2xx."""
+        import json as _json
+        import urllib.request
+        at = ax.current_access_token()
+        req = urllib.request.Request(
+            f"{ax.MESSAGES_URL}/{message_id}",
+            data=_json.dumps({"content": content}).encode(),
+            method="PATCH",
+            headers={"Authorization": "Bearer " + at, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return 200 <= r.status < 300
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "group", "chat_id": chat_id}
 
