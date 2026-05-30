@@ -136,6 +136,13 @@ class AXAdapter(BasePlatformAdapter):
         self._refresh_thread = threading.Thread(
             target=ax.proactive_refresh_loop, name="ax-refresh", daemon=True)
         self._refresh_thread.start()
+        # Platform heartbeat (POST /api/v1/agents/heartbeat ~every 20s) so the
+        # agent shows Online in the availability views. Without this a live
+        # gateway agent reads Dormant/Offline (it never POSTs liveness). Uses
+        # AGENT_ID/SPACE_ID from env — no dependence on listener stream globals.
+        self._heartbeat_thread = threading.Thread(
+            target=ax.presence_loop, name="ax-heartbeat", daemon=True)
+        self._heartbeat_thread.start()
         # Blocking SSE reader -> bridges events onto the asyncio loop.
         self._reader_thread = threading.Thread(
             target=self._sse_reader, name="ax-sse", daemon=True)
