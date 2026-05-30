@@ -343,6 +343,87 @@ class AXAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "group", "chat_id": chat_id}
 
+    # ── Media / attachments ──────────────────────────────────────────────────────
+    # Verified contract (peach, 2026-05-30): POST /api/v1/uploads/ (multipart `file`,
+    # space_id optional) -> {id, attachment_id, file_id, url, content_type, ...};
+    # then POST a message with attachments=[<that full upload dict>] (NOT the id
+    # string — that 422s) → lands in metadata.attachments and renders inline.
+    def _ax_upload(self, path: str, content_type: str, filename: Optional[str] = None) -> Optional[dict]:
+        """Blocking multipart upload to /api/v1/uploads/. Returns the upload dict."""
+        import json as _json
+        import urllib.request
+        import uuid
+        fn = filename or os.path.basename(path)
+        boundary = "----ax" + uuid.uuid4().hex
+        with open(path, "rb") as f:
+            data = f.read()
+        body = (
+            f"--{boundary}\r\n".encode()
+            + f'Content-Disposition: form-data; name="file"; filename="{fn}"\r\n'.encode()
+            + f"Content-Type: {content_type}\r\n\r\n".encode()
+            + data + b"\r\n"
+            + f"--{boundary}--\r\n".encode()
+        )
+        req = urllib.request.Request(
+            ax.BASE + "/api/v1/uploads/", data=body, method="POST",
+            headers={"Authorization": "Bearer " + ax.current_access_token(),
+                     "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return _json.load(r)
+
+    def _ax_post_attachment(self, chat_id, content, up, reply_to):
+        """Blocking: post a message carrying the uploaded file as an attachment."""
+        import json as _json
+        import urllib.request
+        payload = {"content": content or "", "space_id": chat_id, "channel": "main",
+                   "message_type": "text", "attachments": [up]}
+        if reply_to:
+            payload["parent_id"] = reply_to
+        req = urllib.request.Request(
+            ax.MESSAGES_URL, data=_json.dumps(payload).encode(), method="POST",
+            headers={"Authorization": "Bearer " + ax.current_access_token(),
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = _json.load(r)
+        return (d.get("message") or d).get("id")
+
+    async def _send_file(self, chat_id, path, content_type, caption, reply_to, filename=None) -> SendResult:
+        """Upload a local file and post it as a message attachment. Falls back to a
+        text message (path/URL in content) if it's not a readable local file."""
+        loop = asyncio.get_running_loop()
+        if not (path and os.path.isfile(os.path.expanduser(path))):
+            # Not a local file (e.g. an http image_url) — degrade to a text post.
+            return await self.send(chat_id, (caption or "") + (f"\n{path}" if path else ""), reply_to)
+        p = os.path.expanduser(path)
+        try:
+            up = await loop.run_in_executor(None, self._ax_upload, p, content_type, filename)
+            if not up:
+                return SendResult(success=False, error="aX upload failed", retryable=True)
+            mid = await loop.run_in_executor(None, self._ax_post_attachment, chat_id, caption, up, reply_to)
+            return SendResult(success=bool(mid), message_id=str(mid) if mid else None, retryable=not mid)
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+
+    @staticmethod
+    def _guess_mime(path: str, default: str) -> str:
+        import mimetypes
+        return mimetypes.guess_type(path)[0] or default
+
+    async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, audio_path, self._guess_mime(audio_path, "audio/mpeg"), caption, reply_to)
+
+    async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, image_url, self._guess_mime(image_url, "image/png"), caption, reply_to)
+
+    async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, image_path, self._guess_mime(image_path, "image/png"), caption, reply_to)
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, file_path, self._guess_mime(file_path, "application/octet-stream"), caption, reply_to, filename=file_name)
+
+    async def send_video(self, chat_id, video_path, caption=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, video_path, self._guess_mime(video_path, "video/mp4"), caption, reply_to)
+
 
 # ── Plugin registration ──────────────────────────────────────────────────────────
 def check_requirements() -> bool:
