@@ -457,12 +457,55 @@ def _env_enablement() -> Optional[dict]:
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None,
                            media_files=None, force_document=False):
     """Out-of-process cron delivery (deliver=ax) when cron runs separately from
-    the gateway. Reuses the listener's post primitive directly."""
+    the gateway.
+
+    Mirrors the live gateway adapter's media contract: upload each local file,
+    then create a message with ``attachments=[<full upload dict>]``. This keeps
+    cron/send_message delivery from degrading ``MEDIA:/path`` outputs into plain
+    text on aX.
+    """
+    media_files = media_files or []
     try:
-        mid = ax.post_message(message, parent_id=thread_id, space_id=chat_id)
-        if mid:
-            return {"success": True, "message_id": str(mid)}
-        return {"error": "aX standalone send: post failed"}
+        # No media: keep the simple text path.
+        if not media_files:
+            mid = ax.post_message(message, parent_id=thread_id, space_id=chat_id)
+            if mid:
+                return {"success": True, "message_id": str(mid)}
+            return {"error": "aX standalone send: post failed"}
+
+        sent_ids = []
+        remaining_caption = message or ""
+        for media in media_files:
+            media_path = media[0] if isinstance(media, (list, tuple)) else str(media)
+            if not (media_path and os.path.isfile(os.path.expanduser(media_path))):
+                continue
+            path = os.path.expanduser(media_path)
+            content_type = AXAdapter._guess_mime(path, "application/octet-stream")
+            # _ax_upload/_ax_post_attachment do not depend on instance state;
+            # call the proven helper implementations without constructing the
+            # live gateway adapter (Platform("ax") may not exist in standalone
+            # plugin import contexts until registration finishes).
+            up = AXAdapter._ax_upload(None, path, content_type)
+            if not up:
+                continue
+            mid = AXAdapter._ax_post_attachment(None, chat_id, remaining_caption, up, thread_id)
+            if mid:
+                sent_ids.append(str(mid))
+                # Only the first attachment carries the text/caption.
+                remaining_caption = ""
+
+        if sent_ids:
+            return {"success": True, "message_id": sent_ids[-1], "message_ids": sent_ids}
+
+        # Media was requested but nothing attached. Fall back to text if present,
+        # but report the attachment failure so callers do not mistake it for a
+        # native media delivery.
+        if message:
+            mid = ax.post_message(message, parent_id=thread_id, space_id=chat_id)
+            if mid:
+                return {"success": False, "message_id": str(mid),
+                        "error": "aX standalone media upload failed; text fallback posted"}
+        return {"error": "aX standalone send: no media files attached"}
     except Exception as e:
         return {"error": f"aX standalone send failed: {e}"}
 
