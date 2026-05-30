@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import threading
 import time
@@ -259,19 +260,50 @@ class AXAdapter(BasePlatformAdapter):
             message_id=mid,
             reply_to_message_id=mid,  # reply threads under the triggering message
         )
-        # Instant receipt so the sender's progress bar shows activity immediately.
+        # Show the activity box on the sender's message immediately — status only,
+        # no generic "working" text. Real tool activity fills it in via send()/edit.
         try:
-            ax.post_processing_status(mid, "thinking", f"@{self.handle} is on it")
+            ax.post_processing_status(mid, "thinking")
         except Exception:
             pass
         if self._loop and not self._loop.is_closed():
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
 
     # ── Outbound ─────────────────────────────────────────────────────────────────
+    # Gateway tool-progress lines look like '💻 terminal: "…"' / '⚙️ tool(...)'.
+    # Tool names are lowercase by convention, which keeps prose like '✅ Done:'
+    # from matching. These belong in the activity box, NOT as chat messages.
+    _PROGRESS_RE = re.compile(r'^\s*[^\w\s@#]\S*\s+[a-z][\w.\-]*\s*(:|\(|\.\.\.)')
+
+    @classmethod
+    def _looks_like_progress(cls, content: str) -> bool:
+        if not content or len(content) > 800:
+            return False
+        first = next((l for l in content.splitlines() if l.strip()), "")
+        return bool(cls._PROGRESS_RE.match(first))
+
+    def _post_activity(self, chat_id: str, content: str) -> None:
+        """Push the freshest tool-progress line into the activity box on the
+        sender's message (processing-status) — blocking; call via executor."""
+        mid = self._last_mid.get(chat_id)
+        if not mid:
+            return
+        line = next((l.strip() for l in reversed(content.splitlines()) if l.strip()),
+                    content.strip())
+        try:
+            ax.post_processing_status(mid, "working", line[:200])
+        except Exception:
+            pass
+
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         loop = asyncio.get_running_loop()
+        # Tool-progress → activity box on the user's message (not a chat message).
+        # Only the agent's final reply is posted as an actual aX message.
+        if self._looks_like_progress(content):
+            await loop.run_in_executor(None, self._post_activity, chat_id, content)
+            return SendResult(success=True, message_id="activity")
         try:
             mid = await loop.run_in_executor(
                 None, lambda: ax.post_message(content, parent_id=reply_to, space_id=chat_id)
@@ -279,65 +311,34 @@ class AXAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e), retryable=True)
         if not mid:
-            # transient post failure -> let the base retry
             return SendResult(success=False, error="aX post failed", retryable=True)
         return SendResult(success=True, message_id=str(mid))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """aX 'typing' = a processing-status update on the message being answered."""
+        """Keep the activity box alive (status only — no generic 'working' text;
+        the real tool lines drive the box via send()/edit_message)."""
         mid = (metadata or {}).get("message_id") or self._last_mid.get(chat_id)
         if not mid:
             return
         try:
             await asyncio.get_running_loop().run_in_executor(
-                None, lambda: ax.post_processing_status(mid, "thinking", f"@{self.handle} is working…")
-            )
+                None, lambda: ax.post_processing_status(mid, "thinking"))
         except Exception:
             pass
 
     async def edit_message(self, chat_id: str, message_id: str, content: str,
                            reply_to: Optional[str] = None,
                            metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Edit a message in place (aX: PATCH /api/v1/messages/{id}).
-
-        Implementing this is what makes the gateway stream its rich per-tool
-        progress feed to aX — without edit_message the gateway SKIPS tool
-        progress entirely. The gateway posts one progress message via send()
-        then edits it here with each tool/step, so the sender sees a live
-        'what the agent is doing right now' feed instead of a black box.
-        We also mirror the latest line to the aX processing-status (Activity
-        Monitor) so the progress shows there too.
+        """The gateway calls edit_message to update its tool-progress feed.
+        Implementing it is what makes the gateway EMIT tool progress at all
+        (it skips progress for adapters without edit_message). We route that
+        progress into the activity box on the user's message via
+        processing-status — NOT an in-chat edit — so only the final reply
+        lives in the channel and the tools show up in the message's activity box.
         """
-        loop = asyncio.get_running_loop()
-        # mirror the freshest progress line to the activity/processing surface
-        last_line = next((l for l in reversed(content.splitlines()) if l.strip()), content)
-        mid = self._last_mid.get(chat_id)
-        if mid:
-            try:
-                await loop.run_in_executor(
-                    None, lambda: ax.post_processing_status(mid, "thinking", last_line[:200]))
-            except Exception:
-                pass
-        try:
-            ok = await loop.run_in_executor(None, lambda: self._ax_edit(message_id, content))
-        except Exception as e:
-            return SendResult(success=False, error=str(e), retryable=True)
-        return SendResult(success=bool(ok), message_id=message_id, retryable=not ok)
-
-    @staticmethod
-    def _ax_edit(message_id: str, content: str) -> bool:
-        """PATCH an existing aX message's content. Returns True on 2xx."""
-        import json as _json
-        import urllib.request
-        at = ax.current_access_token()
-        req = urllib.request.Request(
-            f"{ax.MESSAGES_URL}/{message_id}",
-            data=_json.dumps({"content": content}).encode(),
-            method="PATCH",
-            headers={"Authorization": "Bearer " + at, "Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return 200 <= r.status < 300
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._post_activity, chat_id, content)
+        return SendResult(success=True, message_id=message_id)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "group", "chat_id": chat_id}
